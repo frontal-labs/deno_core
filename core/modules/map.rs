@@ -122,6 +122,7 @@ pub(crate) struct ModuleMap {
   pub(crate) loader: RefCell<Rc<dyn ModuleLoader>>,
   pub(crate) import_meta_resolve_cb: ImportMetaResolveCallback,
 
+  mod_evaluate_ptr: Cell<Option<*mut ModEvaluate>>,
   exception_state: Rc<ExceptionState>,
   dynamic_import_map:
     RefCell<HashMap<ModuleLoadId, v8::Global<v8::PromiseResolver>>>,
@@ -154,6 +155,9 @@ impl ModuleMap {
     self.preparing_dynamic_imports.borrow_mut().clear();
     self.pending_dynamic_imports.borrow_mut().clear();
     self.code_cache_ready_futs.borrow_mut().clear();
+    if let Some(ptr) = self.mod_evaluate_ptr.take() {
+      unsafe { drop(Box::from_raw(ptr)) }
+    }
     std::mem::take(&mut *self.data.borrow_mut());
   }
 
@@ -210,6 +214,7 @@ impl ModuleMap {
       loader: loader.into(),
       exception_state,
       import_meta_resolve_cb,
+      mod_evaluate_ptr: Default::default(),
       dyn_module_evaluate_idle_counter: Default::default(),
       dynamic_import_map: Default::default(),
       preparing_dynamic_imports: Default::default(),
@@ -1049,15 +1054,15 @@ impl ModuleMap {
       };
 
       // Create a ModEvaluate instance and stash it in an external
-      let evaluation = v8::External::new(
-        tc_scope,
-        Box::into_raw(Box::new(ModEvaluate {
-          module_map: self.clone(),
-          sender: Some(sender),
-          notify,
-          module,
-        })) as _,
-      );
+      let mod_evaluate_ptr = Box::into_raw(Box::new(ModEvaluate {
+        module_map: self.clone(),
+        sender: Some(sender),
+        notify,
+        module,
+      }));
+      let evaluation = v8::External::new(tc_scope, mod_evaluate_ptr as _);
+
+      self.mod_evaluate_ptr.set(Some(mod_evaluate_ptr));
 
       fn get_sender(arg: v8::Local<v8::Value>) -> ModEvaluate {
         let sender = v8::Local::<v8::External>::try_from(arg).unwrap();
@@ -1070,6 +1075,7 @@ impl ModuleMap {
          _rv: v8::ReturnValue| {
           let mut sender = get_sender(args.data());
           sender.module_map.pending_mod_evaluation.set(false);
+          sender.module_map.mod_evaluate_ptr.take();
           sender.module_map.module_waker.wake();
           sender.notify(scope);
         },
@@ -1083,6 +1089,7 @@ impl ModuleMap {
          _rv: v8::ReturnValue| {
           let mut sender = get_sender(args.data());
           sender.module_map.pending_mod_evaluation.set(false);
+          sender.module_map.mod_evaluate_ptr.take();
           sender.module_map.module_waker.wake();
           _ = sender.sender.take().unwrap().send(Ok(()));
           scope.throw_exception(args.get(0));
@@ -1108,6 +1115,7 @@ impl ModuleMap {
 
         // Unset pending mod evaluation as the handlers will never run. See debug_assert below.
         self.pending_mod_evaluation.set(false);
+        self.mod_evaluate_ptr.take();
 
         let mut sender = get_sender(evaluation.into());
         match promise.state() {
