@@ -155,6 +155,9 @@ pub fn to_v8_error<'a>(
         "Custom error class must have a builder registered".to_string();
       if tc_scope.has_caught() {
         let e = tc_scope.exception().unwrap();
+        if e.is_null_or_undefined() {
+          return message.into();
+        }
         let js_error = JsError::from_v8_exception(tc_scope, e);
         msg = format!("{}: {}", msg, js_error.exception_message);
       }
