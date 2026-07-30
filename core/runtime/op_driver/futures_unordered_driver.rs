@@ -272,6 +272,12 @@ impl<F: Future<Output = R>, R> SubmissionQueueFutures for FuturesUnordered<F> {
 #[derive(Default)]
 struct Queue<F: SubmissionQueueFutures> {
   queue: RefCell<F>,
+  /// Futures submitted re-entrantly (via [`SubmissionQueue::spawn`]) while
+  /// `queue` is already borrowed by [`SubmissionQueueResults::poll_next_unpin`]
+  /// — e.g. an op whose completion callback synchronously spawns another op.
+  /// Buffered here to avoid a `RefCell` double-borrow, then drained into
+  /// `queue` on the next poll.
+  pending: RefCell<Vec<F::Future>>,
   item_waker: UnsyncWaker,
 }
 
@@ -291,6 +297,16 @@ pub struct SubmissionQueueResults<F: SubmissionQueueFutures> {
 impl<F: SubmissionQueueFutures> SubmissionQueueResults<F> {
   pub fn poll_next_unpin(&mut self, cx: &mut Context) -> Poll<F::Output> {
     let mut queue = self.queue.queue.borrow_mut();
+    // Drain futures that were submitted re-entrantly while `queue` was borrowed
+    // during a prior poll. Scoped so the `pending` borrow is released before
+    // polling `queue` (a re-entrant `spawn` during that poll must be able to
+    // borrow `pending`).
+    {
+      let mut pending = self.queue.pending.borrow_mut();
+      for f in pending.drain(..) {
+        queue.spawn(f);
+      }
+    }
     self.queue.item_waker.register(cx.waker());
     if queue.len() == 0 {
       return Poll::Pending;
@@ -305,7 +321,13 @@ pub struct SubmissionQueue<F: SubmissionQueueFutures> {
 
 impl<F: SubmissionQueueFutures> SubmissionQueue<F> {
   pub fn spawn(&self, f: F::Future) {
-    self.queue.queue.borrow_mut().spawn(f);
+    match self.queue.queue.try_borrow_mut() {
+      Ok(mut queue) => queue.spawn(f),
+      // Re-entrant submission while the queue is being polled: defer to the
+      // pending buffer (drained at the start of the next poll). `wake_by_ref`
+      // below guarantees that re-poll happens.
+      Err(_) => self.queue.pending.borrow_mut().push(f),
+    }
     self.queue.item_waker.wake_by_ref();
   }
 }
