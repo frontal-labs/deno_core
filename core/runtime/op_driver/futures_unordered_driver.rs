@@ -269,7 +269,6 @@ impl<F: Future<Output = R>, R> SubmissionQueueFutures for FuturesUnordered<F> {
   }
 }
 
-#[derive(Default)]
 struct Queue<F: SubmissionQueueFutures> {
   queue: RefCell<F>,
   /// Futures submitted re-entrantly (via [`SubmissionQueue::spawn`]) while
@@ -279,6 +278,19 @@ struct Queue<F: SubmissionQueueFutures> {
   /// `queue` on the next poll.
   pending: RefCell<Vec<F::Future>>,
   item_waker: UnsyncWaker,
+}
+
+// Manual impl (not `#[derive]`) so the `pending: Vec<F::Future>` field does not
+// impose an unnecessary `F::Future: Default` bound. `F: Default` holds via the
+// `SubmissionQueueFutures: Default` supertrait.
+impl<F: SubmissionQueueFutures> Default for Queue<F> {
+  fn default() -> Self {
+    Self {
+      queue: RefCell::new(F::default()),
+      pending: RefCell::new(Vec::new()),
+      item_waker: UnsyncWaker::default(),
+    }
+  }
 }
 
 pub trait SubmissionQueueFutures: Default {
