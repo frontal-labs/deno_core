@@ -310,14 +310,20 @@ impl<F: SubmissionQueueFutures> SubmissionQueueResults<F> {
   pub fn poll_next_unpin(&mut self, cx: &mut Context) -> Poll<F::Output> {
     let mut queue = self.queue.queue.borrow_mut();
     // Drain futures that were submitted re-entrantly while `queue` was borrowed
-    // during a prior poll. Scoped so the `pending` borrow is released before
-    // polling `queue` (a re-entrant `spawn` during that poll must be able to
-    // borrow `pending`).
-    {
-      let mut pending = self.queue.pending.borrow_mut();
-      for f in pending.drain(..) {
-        queue.spawn(f);
-      }
+    // during a prior poll.
+    //
+    // Take the buffer out and drop the borrow *before* spawning, rather than
+    // draining in place. `queue.spawn` is a trait method, so this side cannot
+    // know whether it re-enters `SubmissionQueue::spawn`; draining in place held
+    // `pending` across every one of those calls, and a re-entrant submission
+    // then found `queue` borrowed (handled) *and* `pending` borrowed (not), so
+    // it aborted on the very buffer added to prevent aborting.
+    //
+    // Anything submitted while this loop runs lands in the fresh buffer and is
+    // drained on the next poll, which `item_waker` has already scheduled.
+    let pending = std::mem::take(&mut *self.queue.pending.borrow_mut());
+    for f in pending {
+      queue.spawn(f);
     }
     self.queue.item_waker.register(cx.waker());
     if queue.len() == 0 {
@@ -356,4 +362,104 @@ pub fn new_submission_queue<F: SubmissionQueueFutures>(
     },
     SubmissionQueueResults { queue },
   )
+}
+
+#[cfg(test)]
+mod submission_queue_tests {
+  use super::*;
+  use std::future::Ready;
+
+  thread_local! {
+    /// Lets the fake queue below call back into the `SubmissionQueue` that owns
+    /// it, which is what an op's completion callback does in the real runtime.
+    static REENTRY: RefCell<Option<SubmissionQueue<ReentrantQueue>>> =
+      const { RefCell::new(None) };
+  }
+
+  fn reenter() {
+    REENTRY.with(|slot| {
+      if let Some(queue) = slot.borrow().as_ref() {
+        queue.spawn(ready(()));
+      }
+    });
+  }
+
+  /// A queue that submits one extra future back into the `SubmissionQueue` from
+  /// inside each of the two places the driver calls into it. `spawn` is the
+  /// interesting one: the driver used to call it while holding a `pending`
+  /// borrow.
+  #[derive(Default)]
+  struct ReentrantQueue {
+    inner: FuturesUnordered<Ready<()>>,
+    reenter_on_poll: bool,
+    reenter_on_spawn: bool,
+  }
+
+  impl SubmissionQueueFutures for ReentrantQueue {
+    type Future = Ready<()>;
+    type Output = ();
+
+    fn len(&self) -> usize {
+      self.inner.len()
+    }
+
+    fn spawn(&mut self, f: Self::Future) {
+      if self.reenter_on_spawn {
+        // Once only: this stands in for a completion callback scheduling more
+        // work while the driver is draining its pending buffer.
+        self.reenter_on_spawn = false;
+        reenter();
+      }
+      self.inner.push(f);
+    }
+
+    fn poll_next_unpin(&mut self, cx: &mut Context) -> Poll<Self::Output> {
+      if self.reenter_on_poll {
+        self.reenter_on_poll = false;
+        reenter();
+      }
+      match Pin::new(&mut self.inner).poll_next(cx) {
+        Poll::Ready(Some(())) => Poll::Ready(()),
+        _ => Poll::Pending,
+      }
+    }
+  }
+
+  /// Regression: a re-entrant submission that arrives while the driver is
+  /// draining `pending` must not abort.
+  ///
+  /// `poll_next_unpin` holds `queue` for its whole body, so a re-entrant
+  /// `spawn` correctly diverts to `pending`. Draining that buffer in place then
+  /// held `pending` across every `queue.spawn` call, and the next re-entrant
+  /// submission found *both* borrowed — aborting on the very buffer added to
+  /// prevent aborting. `RefCell` panics are non-unwinding here, so before the
+  /// fix this test killed the process rather than failing.
+  #[test]
+  fn drain_does_not_hold_pending_across_spawn() {
+    let (queue, mut results) = new_submission_queue::<ReentrantQueue>();
+    // A second handle onto the same `Queue`, which is what the runtime hands to
+    // op callbacks. `SubmissionQueue` is not `Clone`, but the `Rc` is.
+    REENTRY.with(|slot| {
+      *slot.borrow_mut() = Some(SubmissionQueue {
+        queue: results.queue.clone(),
+      })
+    });
+
+    // First poll: re-enter from inside the poll, so `queue` is borrowed and the
+    // submission lands in `pending`.
+    queue.spawn(ready(()));
+    results.queue.queue.borrow_mut().reenter_on_poll = true;
+    let cx = &mut Context::from_waker(noop_waker_ref());
+    let _ = results.poll_next_unpin(cx);
+
+    // Second poll: `pending` is non-empty and gets drained. Arm the re-entrant
+    // submission to fire from inside `spawn`, i.e. mid-drain.
+    results.queue.queue.borrow_mut().reenter_on_spawn = true;
+    let _ = results.poll_next_unpin(cx);
+
+    // Reaching here at all is the assertion; the pre-fix driver aborted above.
+    // The late submission is still accounted for rather than dropped.
+    let _ = results.poll_next_unpin(cx);
+    REENTRY.with(|slot| *slot.borrow_mut() = None);
+  }
 }
