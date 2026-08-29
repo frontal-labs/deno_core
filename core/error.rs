@@ -295,6 +295,15 @@ pub fn to_v8_error<'a>(
         "Custom error class must have a builder registered".to_string();
       if tc_scope.has_caught() {
         let e = tc_scope.exception().unwrap();
+        // A bare `null`/`undefined` here is what V8 reports when the call
+        // failed because the isolate is terminating, not because the class
+        // lacks a builder: `TryCatch::exception()` is null while execution is
+        // being torn down. Panicking on it aborts the process, since this is
+        // reached from ops running behind `extern "C"` frames. Fall back to the
+        // plain message instead, matching upstream deno_core.
+        if e.is_null_or_undefined() {
+          return message.into();
+        }
         let js_error = JsError::from_v8_exception(tc_scope, e);
         msg = format!("{}: {}", msg, js_error.exception_message);
       }
