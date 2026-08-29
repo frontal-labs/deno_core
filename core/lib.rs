@@ -181,6 +181,9 @@ pub mod _ops {
   pub use super::extensions::Op;
   pub use super::extensions::OpDecl;
   pub use super::extensions::OpMethodDecl;
+  pub use super::ops::borrow_op_state;
+  pub use super::ops::borrow_op_state_mut;
+  pub use super::ops::op_stack_description;
   #[cfg(debug_assertions)]
   pub use super::ops::reentrancy_check;
   pub use super::ops::OpCtx;

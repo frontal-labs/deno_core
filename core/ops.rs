@@ -25,15 +25,32 @@ pub type OpId = u16;
 #[cfg(debug_assertions)]
 thread_local! {
   static CURRENT_OP: std::cell::Cell<Option<&'static OpDecl>> = None.into();
+  /// Every op frame currently on this thread's stack, *including* the
+  /// `#[op2(reentrant)]` ones that `CURRENT_OP` deliberately does not record.
+  /// Diagnostics only: it is what names the holder when an op state borrow
+  /// conflicts, which the panic alone cannot do (the failing op's backtrace
+  /// dead-ends at V8's JIT frames).
+  static OP_STACK: RefCell<Vec<(&'static str, std::thread::ThreadId)>> =
+    const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(debug_assertions)]
-pub struct ReentrancyGuard {}
+pub struct ReentrancyGuard {
+  /// Whether this frame is the one that set `CURRENT_OP`.
+  blocking: bool,
+}
 
 #[cfg(debug_assertions)]
 impl Drop for ReentrancyGuard {
   fn drop(&mut self) {
-    CURRENT_OP.with(|f| f.set(None));
+    if self.blocking {
+      CURRENT_OP.with(|f| f.set(None));
+    }
+    let _ = OP_STACK.try_with(|f| {
+      if let Ok(mut stack) = f.try_borrow_mut() {
+        stack.pop();
+      }
+    });
   }
 }
 
@@ -41,16 +58,84 @@ impl Drop for ReentrancyGuard {
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn reentrancy_check(decl: &'static OpDecl) -> Option<ReentrancyGuard> {
-  if decl.is_reentrant {
-    return None;
+  // Reentrant ops still get a frame pushed, but must not arm the check --
+  // being able to invoke ops from inside them is the point of the marker.
+  let blocking = !decl.is_reentrant;
+  if blocking {
+    let current = CURRENT_OP.with(|f| f.get());
+    if let Some(current) = current {
+      panic!("op {} was not marked as #[op2(reentrant)], but re-entrantly invoked op {}", current.name, decl.name);
+    }
+    CURRENT_OP.with(|f| f.set(Some(decl)));
   }
+  let _ = OP_STACK.try_with(|f| {
+    if let Ok(mut stack) = f.try_borrow_mut() {
+      stack.push((decl.name, std::thread::current().id()));
+    }
+  });
+  Some(ReentrancyGuard { blocking })
+}
 
-  let current = CURRENT_OP.with(|f| f.get());
-  if let Some(current) = current {
-    panic!("op {} was not marked as #[op2(reentrant)], but re-entrantly invoked op {}", current.name, decl.name);
+/// Renders this thread's op frames, outermost first.
+#[doc(hidden)]
+pub fn op_stack_description() -> String {
+  #[cfg(debug_assertions)]
+  {
+    OP_STACK
+      .try_with(|f| match f.try_borrow() {
+        Ok(stack) if stack.is_empty() => "<no op frames>".to_string(),
+        Ok(stack) => stack
+          .iter()
+          .map(|(name, thread)| format!("{name} on {thread:?}"))
+          .collect::<Vec<_>>()
+          .join(" -> "),
+        Err(_) => "<op stack unavailable>".to_string(),
+      })
+      .unwrap_or_else(|_| "<op stack unavailable>".to_string())
   }
-  CURRENT_OP.with(|f| f.set(Some(decl)));
-  Some(ReentrancyGuard {})
+  #[cfg(not(debug_assertions))]
+  {
+    "<only tracked in debug builds>".to_string()
+  }
+}
+
+/// Borrows the op state for an op's generated wrapper.
+///
+/// Identical to `RefCell::borrow` except that a conflict reports which op
+/// frames are live on this thread. The bare `RefCell` panic cannot: ops are
+/// invoked through `extern "C"` frames, so the panic aborts and its backtrace
+/// stops at `Builtins_CallApiCallbackGeneric` without ever reaching the Rust
+/// frame that holds the conflicting borrow.
+#[doc(hidden)]
+#[inline(always)]
+pub fn borrow_op_state(state: &RefCell<OpState>) -> std::cell::Ref<'_, OpState> {
+  match state.try_borrow() {
+    Ok(state) => state,
+    Err(_) => op_state_borrow_failed("shared"),
+  }
+}
+
+/// Mutable counterpart of [`borrow_op_state`].
+#[doc(hidden)]
+#[inline(always)]
+pub fn borrow_op_state_mut(
+  state: &RefCell<OpState>,
+) -> std::cell::RefMut<'_, OpState> {
+  match state.try_borrow_mut() {
+    Ok(state) => state,
+    Err(_) => op_state_borrow_failed("mutable"),
+  }
+}
+
+#[doc(hidden)]
+#[cold]
+#[inline(never)]
+fn op_state_borrow_failed(kind: &str) -> ! {
+  panic!(
+    "op state is already borrowed; this op wanted a {kind} borrow on {:?}. Live op frames: {}",
+    std::thread::current().id(),
+    op_stack_description()
+  );
 }
 
 #[derive(Clone, Copy)]
