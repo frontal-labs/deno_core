@@ -308,7 +308,21 @@ pub struct SubmissionQueueResults<F: SubmissionQueueFutures> {
 
 impl<F: SubmissionQueueFutures> SubmissionQueueResults<F> {
   pub fn poll_next_unpin(&mut self, cx: &mut Context) -> Poll<F::Output> {
-    let mut queue = self.queue.queue.borrow_mut();
+    // `try_borrow_mut`, not `borrow_mut`: the borrow below is held across
+    // `queue.poll_next_unpin`, which polls arbitrary op futures, and those are
+    // free to re-enter this driver. A re-entrant poll finding the queue already
+    // borrowed is not a bug to abort on -- the outer poll is draining it and
+    // will make the same progress -- but panicking here is fatal, because op
+    // futures are polled behind `extern "C"` frames where a panic cannot
+    // unwind and takes the process down.
+    //
+    // Report Pending instead, after registering the waker so `item_waker` (woken
+    // by every `SubmissionQueue::spawn`, and by the outer poll's own progress)
+    // brings us back.
+    let Ok(mut queue) = self.queue.queue.try_borrow_mut() else {
+      self.queue.item_waker.register(cx.waker());
+      return Poll::Pending;
+    };
     // Drain futures that were submitted re-entrantly while `queue` was borrowed
     // during a prior poll.
     //
