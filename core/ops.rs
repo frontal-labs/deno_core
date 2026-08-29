@@ -76,85 +76,6 @@ pub fn reentrancy_check(decl: &'static OpDecl) -> Option<ReentrancyGuard> {
   Some(ReentrancyGuard { blocking })
 }
 
-/// Records that Rust is about to run JS, and whether the op state was
-/// *already* borrowed at that moment.
-///
-/// Entering JS while holding an op state borrow is the bug shape behind the
-/// aborts: JS is free to call any op, and an op that wants the state panics
-/// behind an `extern "C"` frame, which cannot unwind. The op stack alone
-/// cannot show this -- the holder is a plain Rust frame, not an op -- so
-/// record the entry point and let the borrow failure name it.
-#[doc(hidden)]
-pub struct JsEntryGuard(());
-
-#[cfg(debug_assertions)]
-thread_local! {
-  static JS_ENTRIES: RefCell<Vec<(&'static str, bool)>> =
-    const { RefCell::new(Vec::new()) };
-}
-
-#[doc(hidden)]
-pub fn note_js_entry(
-  label: &'static str,
-  state: &RefCell<OpState>,
-) -> JsEntryGuard {
-  #[cfg(debug_assertions)]
-  {
-    let already_borrowed = state.try_borrow_mut().is_err();
-    let _ = JS_ENTRIES.try_with(|f| {
-      if let Ok(mut entries) = f.try_borrow_mut() {
-        entries.push((label, already_borrowed));
-      }
-    });
-  }
-  let _ = state;
-  let _ = label;
-  JsEntryGuard(())
-}
-
-impl Drop for JsEntryGuard {
-  fn drop(&mut self) {
-    #[cfg(debug_assertions)]
-    {
-      let _ = JS_ENTRIES.try_with(|f| {
-        if let Ok(mut entries) = f.try_borrow_mut() {
-          entries.pop();
-        }
-      });
-    }
-  }
-}
-
-/// Renders this thread's Rust->JS entries, outermost first, flagging any that
-/// were made while the op state was already borrowed.
-#[doc(hidden)]
-pub fn js_entry_description() -> String {
-  #[cfg(debug_assertions)]
-  {
-    JS_ENTRIES
-      .try_with(|f| match f.try_borrow() {
-        Ok(entries) if entries.is_empty() => "<none>".to_string(),
-        Ok(entries) => entries
-          .iter()
-          .map(|(label, borrowed)| {
-            if *borrowed {
-              format!("{label} (OP STATE ALREADY BORROWED HERE)")
-            } else {
-              (*label).to_string()
-            }
-          })
-          .collect::<Vec<_>>()
-          .join(" -> "),
-        Err(_) => "<unavailable>".to_string(),
-      })
-      .unwrap_or_else(|_| "<unavailable>".to_string())
-  }
-  #[cfg(not(debug_assertions))]
-  {
-    "<only tracked in debug builds>".to_string()
-  }
-}
-
 /// Renders this thread's op frames, outermost first.
 #[doc(hidden)]
 pub fn op_stack_description() -> String {
@@ -211,10 +132,9 @@ pub fn borrow_op_state_mut(
 #[inline(never)]
 fn op_state_borrow_failed(kind: &str) -> ! {
   panic!(
-    "op state is already borrowed; this op wanted a {kind} borrow on {:?}. Live op frames: {}. JS entered from: {}",
+    "op state is already borrowed; this op wanted a {kind} borrow on {:?}. Live op frames: {}",
     std::thread::current().id(),
-    op_stack_description(),
-    js_entry_description()
+    op_stack_description()
   );
 }
 
