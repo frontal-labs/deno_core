@@ -182,6 +182,8 @@ pub mod _ops {
   pub use super::extensions::OpDecl;
   pub use super::extensions::OpMethodDecl;
   pub use super::ops::borrow_op_state;
+  pub use super::ops::js_entry_description;
+  pub use super::ops::note_js_entry;
   pub use super::ops::borrow_op_state_mut;
   pub use super::ops::op_stack_description;
   #[cfg(debug_assertions)]
