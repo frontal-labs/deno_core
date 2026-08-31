@@ -276,7 +276,14 @@ struct Queue<F: SubmissionQueueFutures> {
   /// — e.g. an op whose completion callback synchronously spawns another op.
   /// Buffered here to avoid a `RefCell` double-borrow, then drained into
   /// `queue` on the next poll.
-  pending: RefCell<Vec<F::Future>>,
+  ///
+  /// `Cell`, not `RefCell`: this buffer exists precisely to absorb re-entrant
+  /// submissions, so a borrow conflict *on the buffer itself* is fatal in the
+  /// same way the conflict it was added to prevent is fatal — ops are submitted
+  /// behind `extern "C"` frames where a panic cannot unwind and aborts the
+  /// process. `Cell::take`/`set` cannot panic, and nothing between them can run
+  /// user code, so no window exists for a conflicting access to appear.
+  pending: Cell<Vec<F::Future>>,
   item_waker: UnsyncWaker,
 }
 
@@ -287,7 +294,7 @@ impl<F: SubmissionQueueFutures> Default for Queue<F> {
   fn default() -> Self {
     Self {
       queue: RefCell::new(F::default()),
-      pending: RefCell::new(Vec::new()),
+      pending: Cell::new(Vec::new()),
       item_waker: UnsyncWaker::default(),
     }
   }
@@ -335,7 +342,7 @@ impl<F: SubmissionQueueFutures> SubmissionQueueResults<F> {
     //
     // Anything submitted while this loop runs lands in the fresh buffer and is
     // drained on the next poll, which `item_waker` has already scheduled.
-    let pending = std::mem::take(&mut *self.queue.pending.borrow_mut());
+    let pending = self.queue.pending.take();
     for f in pending {
       queue.spawn(f);
     }
@@ -358,7 +365,13 @@ impl<F: SubmissionQueueFutures> SubmissionQueue<F> {
       // Re-entrant submission while the queue is being polled: defer to the
       // pending buffer (drained at the start of the next poll). `wake_by_ref`
       // below guarantees that re-poll happens.
-      Err(_) => self.queue.pending.borrow_mut().push(f),
+      Err(_) => {
+        // `take` + `push` + `set`: `Vec::push` cannot run user code, so nothing
+        // can observe or mutate the buffer while it is out of the cell.
+        let mut pending = self.queue.pending.take();
+        pending.push(f);
+        self.queue.pending.set(pending);
+      }
     }
     self.queue.item_waker.wake_by_ref();
   }
