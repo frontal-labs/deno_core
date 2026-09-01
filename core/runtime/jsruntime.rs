@@ -2509,20 +2509,10 @@ impl JsRuntime {
       // TODO(mmastrac): we are using this flag
       dispatched_ops = true;
       for task in tasks {
-        let _js_entry = crate::ops::note_js_entry(
-          "v8_task",
-          &JsRuntime::op_state_from(scope),
-        );
         task(scope);
       }
       // We may need to perform a microtask checkpoint here
-      {
-        let _js_entry = crate::ops::note_js_entry(
-          "microtask_checkpoint(v8_task)",
-          &JsRuntime::op_state_from(scope),
-        );
-        scope.perform_microtask_checkpoint();
-      }
+      scope.perform_microtask_checkpoint();
 
       // We don't want tasks that spawn other tasks to starve the event loop, so break
       // after three times around and allow the remainder of the event loop to spin.
@@ -2672,13 +2662,7 @@ impl JsRuntime {
     let js_event_loop_tick_cb =
       js_event_loop_tick_cb.as_ref().unwrap().open(tc_scope);
 
-    {
-      let _js_entry = crate::ops::note_js_entry(
-        "event_loop_tick",
-        &JsRuntime::op_state_from(tc_scope),
-      );
-      js_event_loop_tick_cb.call(tc_scope, undefined, args.as_slice());
-    }
+    js_event_loop_tick_cb.call(tc_scope, undefined, args.as_slice());
 
     if let Some(exception) = tc_scope.exception() {
       return exception_to_err_result(tc_scope, exception, false, true);

@@ -286,13 +286,7 @@ pub fn to_v8_error<'a>(
     );
   }
 
-  let maybe_exception = {
-    let _js_entry = crate::ops::note_js_entry(
-      "build_custom_error",
-      &crate::JsRuntime::op_state_from(tc_scope),
-    );
-    cb.call(tc_scope, this, &args)
-  };
+  let maybe_exception = cb.call(tc_scope, this, &args);
 
   match maybe_exception {
     Some(exception) => exception,
