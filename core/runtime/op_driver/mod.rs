@@ -304,6 +304,68 @@ mod tests {
     });
   }
 
+  /// Op futures must be polled only from `poll_ready`, never from a task the
+  /// driver spawned in the background.
+  ///
+  /// This is a correctness requirement, not a preference. Embedders may hand an
+  /// isolate to another thread while the runtime that spawned it keeps running
+  /// -- edge-runtime does exactly that via `spawn_blocking_non_send`. A
+  /// background pump then polls op futures on one thread while V8 runs the same
+  /// isolate on another, and both touch the same `Rc<RefCell<OpState>>`, whose
+  /// borrow counter is a non-atomic `Cell<isize>`. That is a data race; in
+  /// practice it surfaced as intermittent "RefCell already borrowed" panics
+  /// behind `extern "C"` frames, where a panic cannot unwind and aborts the
+  /// whole process.
+  ///
+  /// So: after submitting a lazy op, yielding to the scheduler repeatedly must
+  /// not advance it. Only `poll_ready` may.
+  #[rstest]
+  #[case::futures_unordered(FuturesUnorderedDriver::<TestMappingContext>::default()
+  )]
+  fn test_driver_does_not_poll_in_background<D: OpDriver<TestMappingContext>>(
+    #[case] driver: D,
+  ) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let polled = Rc::new(Cell::new(false));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    local.block_on(&runtime, async {
+      {
+        let polled = polled.clone();
+        // Lazy so submission cannot poll it eagerly; the only thing that may
+        // advance it afterwards is `poll_ready`.
+        submit_task(&driver, OpScheduling::Lazy, 0, async move {
+          polled.set(true);
+          1
+        });
+      }
+
+      // Give any background task ample opportunity to run. A spawned pump would
+      // be scheduled on this very LocalSet and would poll the op here.
+      for _ in 0..64 {
+        tokio::task::yield_now().await;
+      }
+
+      assert!(
+        !polled.get(),
+        "op future was polled without `poll_ready` -- the driver is polling ops \
+         from a background task, which races any thread executing the isolate"
+      );
+
+      // And confirm the op still completes when the event loop does drive it.
+      let mut bitset = BitSet::default();
+      reap_task(&driver, &mut bitset, "1").await;
+      assert!(polled.get());
+      assert_eq!(bitset.len(), 1);
+    });
+  }
+
   #[rstest]
   #[case::futures_unordered(FuturesUnorderedDriver::<TestMappingContext>::default()
   )]

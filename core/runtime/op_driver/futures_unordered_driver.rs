@@ -9,17 +9,13 @@ use crate::OpId;
 use crate::PromiseId;
 use bit_set::BitSet;
 use deno_error::JsErrorClass;
-use deno_unsync::spawn;
-use deno_unsync::JoinHandle;
 use deno_unsync::UnsyncWaker;
-use futures::future::poll_fn;
 use futures::stream::FuturesUnordered;
 use futures::task::noop_waker_ref;
 use futures::FutureExt;
 use futures::Stream;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::future::ready;
 use std::future::Future;
 use std::pin::Pin;
@@ -28,40 +24,32 @@ use std::task::ready;
 use std::task::Context;
 use std::task::Poll;
 
-async fn poll_task<C: OpMappingContext>(
-  mut results: SubmissionQueueResults<
-    FuturesUnordered<FutureAllocation<PendingOp<C>, PendingOpInfo>>,
-  >,
-  tx: Rc<RefCell<VecDeque<PendingOp<C>>>>,
-  tx_waker: Rc<UnsyncWaker>,
-) {
-  loop {
-    let ready = poll_fn(|cx| results.poll_next_unpin(cx)).await;
-    tx.borrow_mut().push_back(ready);
-    tx_waker.wake_by_ref();
-  }
-}
-
-#[derive(Default)]
-enum MaybeTask {
-  #[default]
-  Empty,
-  Task(Pin<Box<dyn Future<Output = ()>>>),
-  Handle(JoinHandle<()>),
-}
-
 /// [`OpDriver`] implementation built on a tokio [`JoinSet`].
 pub struct FuturesUnorderedDriver<
   C: OpMappingContext + 'static = V8OpMappingContext,
 > {
   len: Cell<usize>,
-  task: Cell<MaybeTask>,
-  task_set: Cell<bool>,
+  /// Polled inline from [`OpDriver::poll_ready`], i.e. on whichever thread is
+  /// currently executing the isolate -- never from a spawned task.
+  ///
+  /// This runtime hands an isolate to a blocking-pool thread
+  /// (`spawn_blocking_non_send`) while the `spawn_pinned` LocalSet worker that
+  /// owns its `LocalSet` keeps running. A background pump therefore polled op
+  /// futures on the worker thread while V8 ran the same isolate on the blocking
+  /// thread, and both touched one `Rc<RefCell<OpState>>` whose borrow counter is
+  /// a non-atomic `Cell<isize>` -- a data race that surfaced as intermittent
+  /// "RefCell already borrowed" panics behind `extern "C"` frames, where a panic
+  /// cannot unwind and aborts the process.
+  ///
+  /// Draining here instead makes the exclusion structural: `poll_ready` is
+  /// reachable only from the event loop, which holds `&mut` on the runtime, so
+  /// the borrow checker guarantees no second thread is inside the isolate.
+  results: SubmissionQueueResults<
+    FuturesUnordered<FutureAllocation<PendingOp<C>, PendingOpInfo>>,
+  >,
   queue: SubmissionQueue<
     FuturesUnordered<FutureAllocation<PendingOp<C>, PendingOpInfo>>,
   >,
-  completed_ops: Rc<RefCell<VecDeque<PendingOp<C>>>>,
-  completed_waker: Rc<UnsyncWaker>,
   arena: FutureArena<PendingOp<C>, PendingOpInfo>,
 }
 
@@ -74,49 +62,20 @@ impl<C: OpMappingContext + 'static> Drop for FuturesUnorderedDriver<C> {
 impl<C: OpMappingContext> Default for FuturesUnorderedDriver<C> {
   fn default() -> Self {
     let (queue, results) = new_submission_queue();
-    let completed_ops = Rc::new(RefCell::new(VecDeque::with_capacity(128)));
-    let completed_waker = Rc::new(UnsyncWaker::default());
-    let task = MaybeTask::Task(Box::pin(poll_task(
-      results,
-      completed_ops.clone(),
-      completed_waker.clone(),
-    )))
-    .into();
 
     Self {
       len: Default::default(),
-      task,
-      task_set: Default::default(),
-      completed_ops,
+      results,
       queue,
-      completed_waker,
       arena: Default::default(),
     }
   }
 }
 
 impl<C: OpMappingContext> FuturesUnorderedDriver<C> {
-  #[inline(always)]
-  fn ensure_task(&self) {
-    if !self.task_set.get() {
-      self.spawn_task();
-    }
-  }
-
-  #[inline(never)]
-  #[cold]
-  fn spawn_task(&self) {
-    let MaybeTask::Task(task) = self.task.replace(Default::default()) else {
-      unreachable!()
-    };
-    self.task.set(MaybeTask::Handle(spawn(task)));
-    self.task_set.set(true);
-  }
-
   /// Spawn a polled task inside a [`FutureAllocation`], along with a function that can map it to a [`PendingOp`].
   #[inline(always)]
   fn spawn(&self, task: FutureAllocation<PendingOp<C>, PendingOpInfo>) {
-    self.ensure_task();
     self.len.set(self.len.get() + 1);
     self.queue.spawn(task);
   }
@@ -213,15 +172,16 @@ impl<C: OpMappingContext> OpDriver<C> for FuturesUnorderedDriver<C> {
     &self,
     cx: &mut Context,
   ) -> Poll<(PromiseId, OpId, OpResult<C>)> {
-    let mut ops = self.completed_ops.borrow_mut();
-    if ops.is_empty() {
-      self.completed_waker.register(cx.waker());
-      return Poll::Pending;
+    // Drive the op futures here rather than from a spawned task. The waker
+    // registered by `poll_next_unpin` is the event loop's own, so a completing
+    // op wakes the loop directly instead of hopping through a second waker.
+    match self.results.poll_next_unpin(cx) {
+      Poll::Ready(PendingOp(PendingOpInfo(promise_id, op_id), resp)) => {
+        self.len.set(self.len.get() - 1);
+        Poll::Ready((promise_id, op_id, resp))
+      }
+      Poll::Pending => Poll::Pending,
     }
-    let item = ops.pop_front().unwrap();
-    let PendingOp(PendingOpInfo(promise_id, op_id), resp) = item;
-    self.len.set(self.len.get() - 1);
-    Poll::Ready((promise_id, op_id, resp))
   }
 
   #[inline(always)]
@@ -230,11 +190,10 @@ impl<C: OpMappingContext> OpDriver<C> for FuturesUnorderedDriver<C> {
   }
 
   fn shutdown(&self) {
-    if let MaybeTask::Handle(h) = self.task.take() {
-      h.abort()
-    }
-    self.completed_ops.borrow_mut().clear();
     self.queue.queue.queue.borrow_mut().clear();
+    // Also drop anything buffered by a re-entrant submission; previously this
+    // was left behind on shutdown.
+    self.queue.queue.pending.set(Vec::new());
   }
 
   fn stats(&self, op_exclusions: &BitSet) -> OpInflightStats {
@@ -314,7 +273,7 @@ pub struct SubmissionQueueResults<F: SubmissionQueueFutures> {
 }
 
 impl<F: SubmissionQueueFutures> SubmissionQueueResults<F> {
-  pub fn poll_next_unpin(&mut self, cx: &mut Context) -> Poll<F::Output> {
+  pub fn poll_next_unpin(&self, cx: &mut Context) -> Poll<F::Output> {
     // `try_borrow_mut`, not `borrow_mut`: the borrow below is held across
     // `queue.poll_next_unpin`, which polls arbitrary op futures, and those are
     // free to re-enter this driver. A re-entrant poll finding the queue already
