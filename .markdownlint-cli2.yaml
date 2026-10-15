@@ -1,0 +1,15 @@
+config:
+  default: true
+  MD013: false
+  MD024:
+    siblings_only: true
+  MD033: false
+  MD041: false
+  MD046:
+    style: fenced
+  MD060: false
+ignores:
+  - "target/**"
+  - "node_modules/**"
+  - "**/LICENSE.md"
+  - "**/NOTICE.md"
