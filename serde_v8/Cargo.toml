@@ -11,7 +11,7 @@ repository.workspace = true
 description = "Rust to V8 serialization and deserialization"
 
 [lib]
-path = "lib.rs"
+path = "src/lib.rs"
 
 [dependencies]
 bytes.workspace = true

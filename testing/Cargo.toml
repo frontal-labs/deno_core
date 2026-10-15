@@ -11,7 +11,7 @@ readme = "README.md"
 repository.workspace = true
 
 [lib]
-path = "./lib.rs"
+path = "src/lib.rs"
 
 [dev-dependencies]
 deno_core.workspace = true

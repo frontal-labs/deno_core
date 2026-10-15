@@ -11,7 +11,7 @@ repository.workspace = true
 description = "A modern JavaScript/TypeScript runtime built with V8, Rust, and Tokio"
 
 [lib]
-path = "lib.rs"
+path = "src/lib.rs"
 
 [features]
 default = ["include_icu_data", "v8_use_custom_libcxx"]

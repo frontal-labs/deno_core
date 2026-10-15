@@ -11,7 +11,7 @@ repository.workspace = true
 description = "Proc macro for writing Deno Ops"
 
 [lib]
-path = "./lib.rs"
+path = "src/lib.rs"
 proc-macro = true
 
 [dependencies]

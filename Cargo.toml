@@ -16,6 +16,9 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/denoland/deno_core"
 
+# Integration tests live beside the package they exercise. The workspace root
+# directory is reserved for shared test documentation and fixtures.
+
 [workspace.dependencies]
 # Local dependencies
 deno_core = { version = "0.238.0", path = "./core" }
