@@ -1,5 +1,5 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
-#![doc = include_str!("README.md")]
+#![doc = include_str!("../README.md")]
 
 use proc_macro::TokenStream;
 use std::error::Error;

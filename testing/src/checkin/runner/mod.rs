@@ -29,7 +29,7 @@ deno_core::extension!(
   ],
   esm_entry_point = "ext:checkin_runtime/__init.js",
   esm = [
-    dir "checkin/runtime",
+    dir "src/checkin/runtime",
     "__init.js",
     "console.ts" with_specifier "checkin:console",
     "testing.ts" with_specifier "checkin:testing",

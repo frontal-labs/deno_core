@@ -292,12 +292,12 @@ mod tests {
   use syn::File;
   use syn::Item;
 
-  #[testing_macros::fixture("op2/test_cases/sync/*.rs")]
+  #[testing_macros::fixture("src/op2/test_cases/sync/*.rs")]
   fn test_proc_macro_sync(input: PathBuf) {
     test_proc_macro_output(input)
   }
 
-  #[testing_macros::fixture("op2/test_cases/async/*.rs")]
+  #[testing_macros::fixture("src/op2/test_cases/async/*.rs")]
   fn test_proc_macro_async(input: PathBuf) {
     test_proc_macro_output(input)
   }
